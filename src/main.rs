@@ -125,7 +125,7 @@ impl PipelineElement for WhereCommand {
                 if let Value::Row(s) = &inp {
                     if let Some(v) = s.get("name") {
                         if let Value::String(filename) = v {
-                            if !filename.contains("thirdparty") {
+                            if filename.contains("thirdparty") {
                                 return Ok(Some(ReturnValue::Value(inp)));
                             }
                         }

@@ -5,7 +5,7 @@ use textwrap::fill;
 use prettytable::format::{Alignment, FormatBuilder, LinePosition, LineSeparator};
 use prettytable::{color, Attr, Cell, Row, Table};
 
-type Entries = Vec<Vec<String>>;
+type Entries = Vec<Vec<(String, &'static str)>>;
 
 use async_trait::async_trait;
 
@@ -101,32 +101,32 @@ fn values_to_entries(values: &[Value], headers: &mut Vec<String>, starting_idx: 
     }
 
     for (idx, value) in values.iter().enumerate() {
-        let mut row: Vec<String> = headers
+        let mut row: Vec<(String, &'static str)> = headers
             .iter()
             .map(|d: &String| {
                 if d == "" {
                     match value {
-                        Value::Row(..) => String::new(),
-                        _ => format!("{}", value),
+                        Value::Row(..) => (String::new(), ""),
+                        _ => (format!("{}", value), ""),
                     }
                 } else {
                     match value {
                         Value::Row(row) => {
                             let data = row.get(d);
                             if let Some(data) = data {
-                                format!("{}", data)
+                                (format!("{}", data), "")
                             } else {
-                                String::new()
+                                (String::new(), "")
                             }
                         }
-                        _ => format!("{}", value),
+                        _ => (format!("{}", value), ""),
                     }
                 }
             })
             .collect();
 
         // Indices are green, bold, right-aligned:
-        row.insert(0, (starting_idx + idx).to_string());
+        row.insert(0, ((starting_idx + idx).to_string(), "Fgbr"));
 
         entries.push(row);
     }
@@ -143,7 +143,7 @@ fn max_per_column(headers: &[String], entries: &Entries, values_len: usize) -> V
         let iter = entries.iter().take(values_len);
 
         for entry in iter {
-            let value_length = entry[i].chars().count();
+            let value_length = entry[i].0.chars().count();
             if value_length > current_col_max {
                 current_col_max = value_length;
             }
@@ -170,7 +170,7 @@ fn maybe_truncate_columns(headers: &mut Vec<String>, entries: &mut Entries, term
         headers.push("...".to_owned());
 
         for entry in entries.iter_mut() {
-            entry.push("...".to_owned()); // ellipsis is centred
+            entry.push(("...".to_owned(), "c")); // ellipsis is centred
         }
     }
 }
@@ -291,7 +291,7 @@ fn wrap_cells(
             headers[head] = fill(&headers[head], max_column_width);
 
             for entry in entries.iter_mut() {
-                entry[head] = fill(&entry[head], max_column_width);
+                entry[head].0 = fill(&entry[head].0, max_column_width);
             }
         }
     }
@@ -359,9 +359,19 @@ impl TableView {
         }
 
         for row in &self.entries {
-            table.add_row(Row::new(row.iter().map(|v| Cell::new(v)).collect()));
+            table.add_row(Row::new(
+                row.iter()
+                    .map(|v| Cell::new(&v.0).style_spec(v.1))
+                    .collect(),
+            ));
         }
 
+        // for row in &table {
+        //     for cell in row.iter() {
+        //         print!("{} | ", cell.get_content());
+        //     }
+        //     println!("");
+        // }
         // table.print_term(&mut *host.out_terminal().ok_or_else(|| ShellError::untagged_runtime_error("Could not open terminal for output"))?)
         //     .map_err(|_| ShellError::untagged_runtime_error("Internal error: could not print to terminal (for unix systems check to make sure TERM is set)"))?;
         table.printstd();
