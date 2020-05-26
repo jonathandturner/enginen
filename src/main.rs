@@ -1,25 +1,94 @@
 use futures::prelude::*;
 use futures::stream::StreamExt;
 use smol::{blocking, iter};
+use std::fmt::Display;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+use indexmap::IndexMap;
 
 use async_trait::async_trait;
 
 type OutStream<T> = Box<dyn std::marker::Send + std::marker::Unpin + futures::Stream<Item = T>>;
 type LazyGlobStream = OutStream<std::result::Result<std::path::PathBuf, glob::GlobError>>;
-type Input = Box<dyn PipelineElement + std::marker::Send>;
+type Connector = Box<dyn PipelineConnector + std::marker::Send>;
+type Element = Box<dyn PipelineElement + std::marker::Send>;
 type PipelineError = Box<dyn std::error::Error>;
+
+#[derive(Debug)]
+enum Value {
+    String(String),
+    Bool(bool),
+    Row(IndexMap<String, Value>),
+    List(Vec<Value>),
+    Nothing,
+}
+
+impl Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::String(s) => write!(f, "{}", s),
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::Row(row) => {
+                let mut first = true;
+                write!(f, "{{")?;
+                for (k, v) in row {
+                    if !first {
+                        write!(f, ", ")?;
+                    } else {
+                        first = false;
+                    }
+                    write!(f, "{}: {}", k, v)?
+                }
+                write!(f, "}}")?;
+                Ok(())
+            }
+            Value::List(list) => {
+                write!(f, "[")?;
+                let mut first = true;
+                for v in list {
+                    if !first {
+                        write!(f, ", ")?;
+                    } else {
+                        first = false;
+                    }
+                    write!(f, "{}", v)?;
+                }
+                write!(f, "]")?;
+                Ok(())
+            }
+            Value::Nothing => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Action {
+    Increment,
+    Greet,
+}
+
+#[derive(Debug)]
+enum ReturnValue {
+    Action(Action),
+    Value(Value),
+}
 
 #[async_trait]
 trait PipelineElement {
-    async fn connect(&mut self, input: Option<Input>) -> Result<(), PipelineError>;
-    async fn next(&mut self) -> Result<Option<String>, PipelineError>;
+    async fn connect(&mut self, input: Option<Connector>) -> Result<(), PipelineError>;
+    async fn next(&mut self) -> Result<Option<ReturnValue>, PipelineError>;
+}
+
+#[async_trait]
+trait PipelineConnector {
+    async fn connect(&mut self, input: Option<Element>) -> Result<(), PipelineError>;
+    async fn next(&mut self) -> Result<Option<Value>, PipelineError>;
 }
 
 struct WhereCommand {
-    input: Option<Input>,
+    input: Option<Connector>,
 }
 
 impl WhereCommand {
@@ -30,17 +99,23 @@ impl WhereCommand {
 
 #[async_trait]
 impl PipelineElement for WhereCommand {
-    async fn connect(&mut self, input: Option<Input>) -> Result<(), PipelineError> {
+    async fn connect(&mut self, input: Option<Connector>) -> Result<(), PipelineError> {
         self.input = input;
 
         Ok(())
     }
 
-    async fn next(&mut self) -> Result<Option<String>, PipelineError> {
+    async fn next(&mut self) -> Result<Option<ReturnValue>, PipelineError> {
         if let Some(input) = &mut self.input {
-            while let Some(res) = input.next().await? {
-                if !res.contains("thirdparty") {
-                    return Ok(Some(res));
+            while let Some(inp) = input.next().await? {
+                if let Value::Row(s) = &inp {
+                    if let Some(v) = s.get("name") {
+                        if let Value::String(filename) = v {
+                            if filename.contains("thirdparty") {
+                                return Ok(Some(ReturnValue::Value(inp)));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -61,7 +136,7 @@ impl LsCommand {
 
 #[async_trait]
 impl PipelineElement for LsCommand {
-    async fn connect(&mut self, _input: Option<Input>) -> Result<(), PipelineError> {
+    async fn connect(&mut self, _input: Option<Connector>) -> Result<(), PipelineError> {
         let dir = blocking!(glob::glob("**/*"))?;
         let dir = iter(dir);
 
@@ -70,13 +145,28 @@ impl PipelineElement for LsCommand {
         Ok(())
     }
 
-    async fn next(&mut self) -> Result<Option<String>, PipelineError> {
+    async fn next(&mut self) -> Result<Option<ReturnValue>, PipelineError> {
         if let Some(inner) = &mut self.inner {
             if let Some(res) = inner.next().await {
                 let res = res?;
                 let metadata = fs::metadata(&res)?;
-                let out = format!("{} {:?}", res.to_string_lossy(), metadata);
-                return Ok(Some(out));
+
+                let mut output = IndexMap::new();
+                output.insert(
+                    "name".to_owned(),
+                    Value::String(res.to_string_lossy().to_string()),
+                );
+
+                let filetype = if metadata.is_dir() {
+                    Value::String("Dir".to_owned())
+                } else if metadata.is_file() {
+                    Value::String("File".to_owned())
+                } else {
+                    Value::Nothing
+                };
+                output.insert("type".to_owned(), filetype);
+
+                return Ok(Some(ReturnValue::Value(Value::Row(output))));
             }
         }
 
@@ -87,7 +177,7 @@ impl PipelineElement for LsCommand {
 struct ActionRunner {
     current_shell: Option<Arc<AtomicUsize>>,
     ctrl_c: Option<piper::Receiver<()>>,
-    input: Option<Input>,
+    input: Option<Element>,
 }
 
 impl ActionRunner {
@@ -101,14 +191,14 @@ impl ActionRunner {
 }
 
 #[async_trait]
-impl PipelineElement for ActionRunner {
-    async fn connect(&mut self, input: Option<Input>) -> Result<(), PipelineError> {
+impl PipelineConnector for ActionRunner {
+    async fn connect(&mut self, input: Option<Element>) -> Result<(), PipelineError> {
         self.input = input;
 
         Ok(())
     }
 
-    async fn next(&mut self) -> Result<Option<String>, PipelineError> {
+    async fn next(&mut self) -> Result<Option<Value>, PipelineError> {
         if let Some(input) = &mut self.input {
             while let Some(res) = input.next().await? {
                 if let Some(ctrl_c) = &mut self.ctrl_c {
@@ -119,12 +209,18 @@ impl PipelineElement for ActionRunner {
                         )));
                     }
                 }
-                if res.contains("bob") {
-                    if let Some(current_shell) = &mut self.current_shell {
-                        current_shell.fetch_add(1, Ordering::Relaxed);
+                match res {
+                    ReturnValue::Action(Action::Increment) => {
+                        if let Some(current_shell) = &mut self.current_shell {
+                            current_shell.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                } else {
-                    return Ok(Some(res));
+                    ReturnValue::Action(Action::Greet) => {
+                        println!("Hello world!");
+                    }
+                    ReturnValue::Value(value) => {
+                        return Ok(Some(value));
+                    }
                 }
             }
         }
@@ -134,7 +230,7 @@ impl PipelineElement for ActionRunner {
 }
 
 fn main() -> Result<(), PipelineError> {
-    let (s, ctrl_c) = piper::chan(100);
+    let (s, ctrl_c) = piper::chan(1);
     let handle = move || {
         let _ = s.send(()).now_or_never();
     };
@@ -150,10 +246,33 @@ fn main() -> Result<(), PipelineError> {
         let mut glue = ActionRunner::new(counter.clone(), ctrl_c.clone());
         glue.connect(Some(Box::new(ls))).await?;
 
+        // let mut glue2 = ActionRunner::new(counter.clone(), ctrl_c.clone());
+        // glue2.connect(Some(Box::new(glue))).await?;
+        // let mut glue3 = ActionRunner::new(counter.clone(), ctrl_c.clone());
+        // glue3.connect(Some(Box::new(glue2))).await?;
+        // let mut glue4 = ActionRunner::new(counter.clone(), ctrl_c.clone());
+        // glue4.connect(Some(Box::new(glue3))).await?;
+        // let mut glue5 = ActionRunner::new(counter.clone(), ctrl_c.clone());
+        // glue5.connect(Some(Box::new(glue4))).await?;
+        // let mut glue6 = ActionRunner::new(counter.clone(), ctrl_c.clone());
+        // glue6.connect(Some(Box::new(glue5))).await?;
+        // let mut glue7 = ActionRunner::new(counter.clone(), ctrl_c.clone());
+        // glue7.connect(Some(Box::new(glue6))).await?;
+        // let mut glue8 = ActionRunner::new(counter.clone(), ctrl_c.clone());
+        // glue8.connect(Some(Box::new(glue7))).await?;
+        // let mut glue9 = ActionRunner::new(counter.clone(), ctrl_c.clone());
+        // glue9.connect(Some(Box::new(glue8))).await?;
+
         let mut where_ = WhereCommand::new();
         where_.connect(Some(Box::new(glue))).await?;
 
-        while let Some(res) = where_.next().await? {
+        let mut drain = ActionRunner::new(counter.clone(), ctrl_c.clone());
+        drain.connect(Some(Box::new(where_))).await?;
+
+        while let Some(res) = drain.next().await? {
+            // if ctrl_c.try_recv().is_some() {
+            //     break;
+            // }
             println!("{}", res);
         }
 
