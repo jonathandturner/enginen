@@ -6,6 +6,8 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+mod table;
+
 use indexmap::IndexMap;
 
 use async_trait::async_trait;
@@ -17,12 +19,24 @@ type Element = Box<dyn PipelineElement + std::marker::Send>;
 type PipelineError = Box<dyn std::error::Error>;
 
 #[derive(Debug)]
-enum Value {
+pub enum Value {
+    // Basic values
     String(String),
     Bool(bool),
+    Nothing,
+
+    // Compound values
     Row(IndexMap<String, Value>),
     List(Vec<Value>),
-    Nothing,
+}
+
+impl Value {
+    pub fn column_names(&self) -> Vec<&String> {
+        match self {
+            Value::Row(row) => row.keys().collect(),
+            _ => vec![],
+        }
+    }
 }
 
 impl Display for Value {
@@ -111,7 +125,7 @@ impl PipelineElement for WhereCommand {
                 if let Value::Row(s) = &inp {
                     if let Some(v) = s.get("name") {
                         if let Value::String(filename) = v {
-                            if filename.contains("thirdparty") {
+                            if !filename.contains("thirdparty") {
                                 return Ok(Some(ReturnValue::Value(inp)));
                             }
                         }
@@ -245,23 +259,6 @@ fn main() -> Result<(), PipelineError> {
 
         let mut glue = ActionRunner::new(counter.clone(), ctrl_c.clone());
         glue.connect(Some(Box::new(ls))).await?;
-
-        // let mut glue2 = ActionRunner::new(counter.clone(), ctrl_c.clone());
-        // glue2.connect(Some(Box::new(glue))).await?;
-        // let mut glue3 = ActionRunner::new(counter.clone(), ctrl_c.clone());
-        // glue3.connect(Some(Box::new(glue2))).await?;
-        // let mut glue4 = ActionRunner::new(counter.clone(), ctrl_c.clone());
-        // glue4.connect(Some(Box::new(glue3))).await?;
-        // let mut glue5 = ActionRunner::new(counter.clone(), ctrl_c.clone());
-        // glue5.connect(Some(Box::new(glue4))).await?;
-        // let mut glue6 = ActionRunner::new(counter.clone(), ctrl_c.clone());
-        // glue6.connect(Some(Box::new(glue5))).await?;
-        // let mut glue7 = ActionRunner::new(counter.clone(), ctrl_c.clone());
-        // glue7.connect(Some(Box::new(glue6))).await?;
-        // let mut glue8 = ActionRunner::new(counter.clone(), ctrl_c.clone());
-        // glue8.connect(Some(Box::new(glue7))).await?;
-        // let mut glue9 = ActionRunner::new(counter.clone(), ctrl_c.clone());
-        // glue9.connect(Some(Box::new(glue8))).await?;
 
         let mut where_ = WhereCommand::new();
         where_.connect(Some(Box::new(glue))).await?;
