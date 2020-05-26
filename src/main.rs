@@ -266,12 +266,17 @@ fn main() -> Result<(), PipelineError> {
         let mut drain = ActionRunner::new(counter.clone(), ctrl_c.clone());
         drain.connect(Some(Box::new(where_))).await?;
 
-        while let Some(res) = drain.next().await? {
+        let mut table = crate::table::TableCommand::new();
+        table.connect(Some(Box::new(drain))).await?;
+
+        while let Some(res) = table.next().await? {
             // if ctrl_c.try_recv().is_some() {
             //     break;
             // }
-            println!("{}", res);
+            //println!("{}", res);
         }
+
+        dbg!(textwrap::termwidth());
 
         dbg!(counter);
         Ok(())
